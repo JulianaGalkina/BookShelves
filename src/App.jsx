@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import AuthPage, { clearAuthSession, getCurrentUser } from './AuthPage.jsx';
-
-const STORAGE_KEY = 'book-diary-v1';
-const SHELVES_STORAGE_KEY = 'book-diary-shelves-v1';
-const LEGACY_SHELVES_STORAGE_KEY = 'book-diary-folders-v1';
+import AuthPage from './AuthPage.jsx';
+import ResetPasswordPage from './ResetPasswordPage.jsx';
+import { authCallback, clearAuthCallback } from './lib/auth.js';
+import { supabase } from './lib/supabase.js';
 const STATUSES = [
   { value: 'reading', label: 'Читаю' },
   { value: 'planned', label: 'В планах' },
@@ -14,6 +13,19 @@ const coverColorIndex = (id) => {
   let hash = 0;
   for (let index = 0; index < id.length; index += 1) hash = (hash * 31 + id.charCodeAt(index)) | 0;
   return (hash >>> 0) % 6;
+};
+const createBookId = (books) => {
+  const latestBook = books.reduce((latest, book) => (
+    !latest || book.addedAt > latest.addedAt ? book : latest
+  ), null);
+  // Legacy indices 0 and 5 are both indigo. Keep existing cover colors unchanged.
+  const nextColor = latestBook ? ((coverColorIndex(latestBook.id) % 5) + 1) % 5 : 0;
+  // Preserve the ID-based color across devices without changing the database schema.
+  let id;
+  do {
+    id = crypto.randomUUID();
+  } while (coverColorIndex(id) !== nextColor);
+  return id;
 };
 const SORT_OPTIONS = [
   { value: 'title', label: 'По названию' },
@@ -30,43 +42,6 @@ const today = () => {
 };
 const formatDate = (value) => new Date(`${value}T00:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
 
-function readBooks(storageKey = STORAGE_KEY) {
-  try {
-    const data = JSON.parse(localStorage.getItem(storageKey) || '[]');
-    return Array.isArray(data) ? data.map((book) => {
-      if (!book || typeof book !== 'object') return book;
-      const { folderId: legacyShelfId, ...currentFields } = book;
-      return { ...currentFields, shelfId: currentFields.shelfId ?? legacyShelfId ?? '' };
-    }) : [];
-  } catch {
-    return [];
-  }
-}
-
-function readShelves(storageKey = SHELVES_STORAGE_KEY, legacyStorageKey = LEGACY_SHELVES_STORAGE_KEY) {
-  try {
-    const currentData = localStorage.getItem(storageKey);
-    if (currentData !== null) {
-      const shelves = JSON.parse(currentData);
-      return Array.isArray(shelves) ? shelves : [];
-    }
-
-    const legacyData = legacyStorageKey ? localStorage.getItem(legacyStorageKey) : null;
-    if (legacyData === null) return [];
-
-    const shelves = JSON.parse(legacyData);
-    if (!Array.isArray(shelves)) return [];
-    try {
-      localStorage.setItem(storageKey, JSON.stringify(shelves));
-    } catch {
-      // Keep legacy data available for this session if storage is full or unavailable.
-    }
-    return shelves;
-  } catch {
-    return [];
-  }
-}
-
 function bookCountLabel(count) {
   const lastTwo = count % 100;
   const last = count % 10;
@@ -75,23 +50,63 @@ function bookCountLabel(count) {
 }
 
 function App() {
-  const [user, setUser] = useState(getCurrentUser);
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [recovering, setRecovering] = useState(authCallback.recovery);
+  const [callbackError, setCallbackError] = useState(authCallback.error || '');
+  const [retryRecovery] = useState(() => new URLSearchParams(window.location.search).get('retry') === '1');
 
-  function logout() {
-    clearAuthSession();
-    setUser(null);
+  useEffect(() => {
+    let mounted = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+      if (error) console.error('Supabase session error:', error.message);
+      if (error) setCallbackError('session_error');
+      setUser(data.session?.user || null);
+      clearAuthCallback();
+      setAuthReady(true);
+    }).catch((error) => {
+      if (!mounted) return;
+      console.error('Supabase connection error:', error);
+      setCallbackError('connection_error');
+      setAuthReady(true);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return;
+      setUser(session?.user || null);
+      if (event === 'PASSWORD_RECOVERY') {
+        setRecovering(true);
+        setCallbackError('');
+        window.history.replaceState({}, '', '/reset-password');
+      }
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  if (!authReady) return <main className="page-shell"><div className="empty-state"><h2>Подключаем аккаунт…</h2></div></main>;
+  function finishRecovery() {
+    clearAuthCallback('/');
+    setRecovering(false);
+    setCallbackError('');
   }
-
-  if (!user) return <AuthPage onAuthenticated={setUser} />;
-  return <Library key={user.id} user={user} onLogout={logout} />;
+  if (recovering) {
+    if (user && !callbackError && !retryRecovery) return <ResetPasswordPage onComplete={finishRecovery} />;
+    return <AuthPage initialMode="forgot" initialError={retryRecovery ? '' : 'Ссылка недействительна или устарела. Запросите новое письмо.'} onBack={finishRecovery} onAuthenticated={setUser} />;
+  }
+  if (!user) return <AuthPage initialError={callbackError ? 'Не удалось завершить вход. Попробуйте ещё раз.' : ''} onAuthenticated={setUser} />;
+  return <Library key={user.id} user={user} onLogout={() => supabase.auth.signOut()} />;
 }
 
 function Library({ user, onLogout }) {
-  const bookStorageKey = user.isDemo ? STORAGE_KEY : `book-diary-${user.id}-books-v1`;
-  const shelfStorageKey = user.isDemo ? SHELVES_STORAGE_KEY : `book-diary-${user.id}-shelves-v1`;
-  const legacyShelfStorageKey = user.isDemo ? LEGACY_SHELVES_STORAGE_KEY : null;
-  const [books, setBooks] = useState(() => readBooks(bookStorageKey));
-  const [shelves, setShelves] = useState(() => readShelves(shelfStorageKey, legacyShelfStorageKey));
+  const [books, setBooks] = useState([]);
+  const [shelves, setShelves] = useState([]);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState('');
   const [filter, setFilter] = useState('all');
   const [activeShelfId, setActiveShelfId] = useState('all');
   const [sortBy, setSortBy] = useState('addedAt');
@@ -110,8 +125,53 @@ function Library({ user, onLogout }) {
   const coverHoldTimer = useRef(null);
   const coverHoldTriggered = useRef(false);
 
-  useEffect(() => localStorage.setItem(bookStorageKey, JSON.stringify(books)), [bookStorageKey, books]);
-  useEffect(() => localStorage.setItem(shelfStorageKey, JSON.stringify(shelves)), [shelfStorageKey, shelves]);
+  async function loadCatalog() {
+    setCatalogLoading(true);
+    setCatalogError('');
+    try {
+      const [booksResult, shelvesResult] = await Promise.all([
+        supabase.from('books').select('*').order('added_at', { ascending: false }),
+        supabase.from('shelves').select('*').order('created_at', { ascending: true }),
+      ]);
+      if (booksResult.error || shelvesResult.error) {
+        setCatalogError(booksResult.error?.message || shelvesResult.error?.message || 'Не удалось загрузить каталог.');
+        return;
+      }
+
+      const mappedBooks = await Promise.all((booksResult.data || []).map(async (row) => {
+        let coverImage = '';
+        if (row.cover_path) {
+          const { data } = await supabase.storage.from('book-covers').createSignedUrl(row.cover_path, 3600);
+          coverImage = data?.signedUrl || '';
+        }
+        return {
+          id: row.id,
+          title: row.title,
+          author: row.author,
+          status: row.status,
+          rating: row.rating ?? '',
+          impression: row.impression || '',
+          startedAt: row.started_at || '',
+          finishedAt: row.finished_at || '',
+          shelfId: row.shelf_id || '',
+          addedAt: row.added_at,
+          coverPath: row.cover_path || '',
+          coverImage,
+        };
+      }));
+
+      setBooks(mappedBooks);
+      setShelves((shelvesResult.data || []).map((row) => ({ id: row.id, name: row.name })));
+    } catch (loadError) {
+      setCatalogError(loadError.message || 'Не удалось подключиться к Supabase.');
+    } finally {
+      setCatalogLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadCatalog();
+  }, [user.id]);
 
   const visibleBooks = useMemo(() => books
     .filter((book) => (filter === 'all' || book.status === filter)
@@ -172,7 +232,7 @@ function Library({ user, onLogout }) {
     });
   }
 
-  function saveBook(event) {
+  async function saveBook(event) {
     event.preventDefault();
     if (!form.title.trim() || !form.author.trim()) {
       setError('Укажите название книги и автора.');
@@ -180,7 +240,7 @@ function Library({ user, onLogout }) {
     }
     const existingBook = books.find((book) => book.id === editingId);
     const saved = {
-      id: editingId || crypto.randomUUID(),
+      id: editingId || createBookId(books),
       title: form.title.trim(),
       author: form.author.trim(),
       status: form.status,
@@ -189,10 +249,31 @@ function Library({ user, onLogout }) {
       startedAt: ['reading', 'read'].includes(form.status) ? form.startedAt : '',
       finishedAt: form.status === 'read' ? (form.finishedAt || today()) : '',
       shelfId: shelves.some((shelf) => shelf.id === form.shelfId) ? form.shelfId : '',
-      addedAt: existingBook?.addedAt || (editingId ? '' : new Date().toISOString()),
+      addedAt: existingBook?.addedAt || new Date().toISOString(),
+      coverPath: existingBook?.coverPath || '',
       coverImage: existingBook?.coverImage || '',
     };
-    setBooks((current) => editingId ? current.map((book) => book.id === editingId ? saved : book) : [saved, ...current]);
+
+    const { error: saveError } = await supabase.from('books').upsert({
+      id: saved.id,
+      user_id: user.id,
+      shelf_id: saved.shelfId || null,
+      title: saved.title,
+      author: saved.author,
+      status: saved.status,
+      rating: saved.rating || null,
+      impression: saved.impression,
+      started_at: saved.startedAt || null,
+      finished_at: saved.finishedAt || null,
+      added_at: saved.addedAt,
+      cover_path: saved.coverPath || null,
+    });
+    if (saveError) {
+      setError(saveError.message);
+      return;
+    }
+
+    await loadCatalog();
     setFormOpen(false);
   }
 
@@ -204,7 +285,7 @@ function Library({ user, onLogout }) {
     setShelfFormOpen(true);
   }
 
-  function saveShelf(event) {
+  async function saveShelf(event) {
     event.preventDefault();
     const name = shelfName.trim();
     if (!name) {
@@ -216,26 +297,46 @@ function Library({ user, onLogout }) {
       return;
     }
     const shelfId = editingShelfId || crypto.randomUUID();
-    const shelf = { id: shelfId, name };
-    setShelves((current) => editingShelfId
-      ? current.map((item) => item.id === shelfId ? shelf : item)
-      : [...current, shelf]);
-    setBooks((current) => current.map((book) => {
-      if (shelfBookIds.includes(book.id)) return { ...book, shelfId };
-      if (editingShelfId && book.shelfId === shelfId) return { ...book, shelfId: '' };
-      return book;
-    }));
+    const shelfResult = editingShelfId
+      ? await supabase.from('shelves').update({ name }).eq('id', shelfId).eq('user_id', user.id).select('id').single()
+      : await supabase.from('shelves').insert({ id: shelfId, user_id: user.id, name }).select('id').single();
+    if (shelfResult.error) {
+      setShelfError(shelfResult.error.message);
+      return;
+    }
+
+    const bookUpdates = books.flatMap((book) => {
+      const shouldAssign = shelfBookIds.includes(book.id);
+      const shouldUnassign = editingShelfId && book.shelfId === shelfId && !shouldAssign;
+      if (!shouldAssign && !shouldUnassign) return [];
+      return [supabase.from('books').update({ shelf_id: shouldAssign ? shelfId : null })
+        .eq('id', book.id).eq('user_id', user.id)];
+    });
+    const updateResults = await Promise.all(bookUpdates);
+    const failedUpdate = updateResults.find((result) => result.error);
+    if (failedUpdate) {
+      setShelfError(failedUpdate.error.message);
+      await loadCatalog();
+      return;
+    }
+
     if (!editingShelfId) setActiveShelfId(shelfId);
+    await loadCatalog();
     setShelfName('');
     setShelfBookIds([]);
     setShelfError('');
     setShelfFormOpen(false);
   }
 
-  function removeShelf(shelf) {
+  async function removeShelf(shelf) {
     if (!window.confirm(`Удалить полку «${shelf.name}»? Книги останутся в трекере без полки.`)) return;
-    setShelves((current) => current.filter((item) => item.id !== shelf.id));
-    setBooks((current) => current.map((book) => book.shelfId === shelf.id ? { ...book, shelfId: '' } : book));
+    const { error: deleteError } = await supabase.from('shelves').delete()
+      .eq('id', shelf.id).eq('user_id', user.id);
+    if (deleteError) {
+      setCatalogError(deleteError.message);
+      return;
+    }
+    await loadCatalog();
     if (activeShelfId === shelf.id) setActiveShelfId('all');
   }
 
@@ -266,9 +367,19 @@ function Library({ user, onLogout }) {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  function removeBook(book) {
+  async function removeBook(book) {
     if (window.confirm(`Удалить «${book.title}» из трекера?`)) {
-      setBooks((current) => current.filter((item) => item.id !== book.id));
+      const { error: deleteError } = await supabase.from('books').delete()
+        .eq('id', book.id).eq('user_id', user.id);
+      if (deleteError) {
+        setCatalogError(deleteError.message);
+        return;
+      }
+      if (book.coverPath) {
+        const { error: storageError } = await supabase.storage.from('book-covers').remove([book.coverPath]);
+        if (storageError) setCatalogError(`Книга удалена, но фото не удалось удалить: ${storageError.message}`);
+      }
+      await loadCatalog();
     }
   }
 
@@ -309,7 +420,7 @@ function Library({ user, onLogout }) {
 
     const imageUrl = URL.createObjectURL(file);
     const image = new Image();
-    image.onload = () => {
+    image.onload = async () => {
       const maxWidth = 420;
       const maxHeight = 630;
       const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height);
@@ -321,8 +432,26 @@ function Library({ user, onLogout }) {
         context.fillStyle = '#fff';
         context.fillRect(0, 0, canvas.width, canvas.height);
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        const coverImage = canvas.toDataURL('image/jpeg', 0.78);
-        setBooks((current) => current.map((book) => book.id === bookId ? { ...book, coverImage } : book));
+        const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.78));
+        if (!blob) {
+          setCatalogError('Не удалось обработать изображение.');
+        } else {
+          const coverPath = `${user.id}/${bookId}.jpg`;
+          const { error: uploadError } = await supabase.storage.from('book-covers').upload(coverPath, blob, {
+            contentType: 'image/jpeg',
+            upsert: true,
+          });
+          if (uploadError) {
+            setCatalogError(uploadError.message);
+          } else {
+            const { error: saveError } = await supabase.from('books')
+              .update({ cover_path: coverPath })
+              .eq('id', bookId)
+              .eq('user_id', user.id);
+            if (saveError) setCatalogError(saveError.message);
+            else await loadCatalog();
+          }
+        }
       }
       URL.revokeObjectURL(imageUrl);
       coverTargetId.current = null;
@@ -347,6 +476,7 @@ function Library({ user, onLogout }) {
       </header>
 
       <section className="library" aria-label="Список книг">
+        {catalogError && <p className="form-error" role="alert">Не удалось выполнить действие: {catalogError}</p>}
         <div className="library-heading">
           <h2>Каталог</h2>
           <div className="library-controls">
@@ -408,7 +538,8 @@ function Library({ user, onLogout }) {
           </div>
         </section>
 
-        {visibleBooks.length ? <div className="book-list">
+        {catalogLoading ? <div className="empty-state"><h3>Загружаем каталог…</h3></div>
+          : visibleBooks.length ? <div className="book-list">
           {visibleBooks.map((book) => {
             const status = STATUSES.find((item) => item.value === book.status);
             return <article className="book-card" key={book.id}>
@@ -460,7 +591,7 @@ function Library({ user, onLogout }) {
         </div>}
       </section>
 
-      <footer className="footer"><div className="footer-notes"><span>Ваш трекер — только для вас</span><span>Сохраняется в этом браузере</span></div><button type="button" className="footer-export" onClick={exportData}>Экспорт CSV</button></footer>
+      <footer className="footer"><div className="footer-notes"><span>Ваш трекер — только для вас</span><span>Сохраняется в вашем аккаунте</span></div><button type="button" className="footer-export" onClick={exportData}>Экспорт CSV</button></footer>
 
       <input ref={coverInputRef} className="cover-file-input" type="file" accept="image/*" onChange={handleCoverImageChange} aria-label="Выбрать фото для обложки" />
 
