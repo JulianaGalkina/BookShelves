@@ -4,19 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "storybook": "storybook dev -p 6006",
-    "build-storybook": "storybook build"
+    "dev": "vite"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
     "react": "latest",
-    "react-dom": "latest",
-    "vite": "latest"
+    "react-dom": "latest"
   },
   "devDependencies": {
-    "@storybook/addon-docs": "^10.6.7",
-    "@storybook/react-vite": "^10.6.7",
-    "storybook": "^10.6.7"
+    "vite": "latest"
   }
 }

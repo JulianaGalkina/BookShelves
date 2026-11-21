@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import AuthPage, { clearAuthSession, getCurrentUser } from './AuthPage.jsx';
 
 const STORAGE_KEY = 'book-diary-v1';
-const FOLDERS_STORAGE_KEY = 'book-diary-folders-v1';
+const SHELVES_STORAGE_KEY = 'book-diary-shelves-v1';
+const LEGACY_SHELVES_STORAGE_KEY = 'book-diary-folders-v1';
 const STATUSES = [
   { value: 'reading', label: 'Читаю' },
   { value: 'planned', label: 'В планах' },
@@ -20,7 +22,7 @@ const SORT_OPTIONS = [
   { value: 'addedAt', label: 'По дате добавления' },
   { value: 'rating', label: 'По рейтингу' },
 ];
-const emptyForm = { title: '', author: '', status: 'reading', rating: '', impression: '', startedAt: '', finishedAt: '', folderId: '' };
+const emptyForm = { title: '', author: '', status: 'reading', rating: '', impression: '', startedAt: '', finishedAt: '', shelfId: '' };
 const today = () => {
   const date = new Date();
   const localOffset = date.getTimezoneOffset() * 60_000;
@@ -28,19 +30,38 @@ const today = () => {
 };
 const formatDate = (value) => new Date(`${value}T00:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
 
-function readBooks() {
+function readBooks(storageKey = STORAGE_KEY) {
   try {
-    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    return Array.isArray(data) ? data : [];
+    const data = JSON.parse(localStorage.getItem(storageKey) || '[]');
+    return Array.isArray(data) ? data.map((book) => {
+      if (!book || typeof book !== 'object') return book;
+      const { folderId: legacyShelfId, ...currentFields } = book;
+      return { ...currentFields, shelfId: currentFields.shelfId ?? legacyShelfId ?? '' };
+    }) : [];
   } catch {
     return [];
   }
 }
 
-function readFolders() {
+function readShelves(storageKey = SHELVES_STORAGE_KEY, legacyStorageKey = LEGACY_SHELVES_STORAGE_KEY) {
   try {
-    const data = JSON.parse(localStorage.getItem(FOLDERS_STORAGE_KEY) || '[]');
-    return Array.isArray(data) ? data : [];
+    const currentData = localStorage.getItem(storageKey);
+    if (currentData !== null) {
+      const shelves = JSON.parse(currentData);
+      return Array.isArray(shelves) ? shelves : [];
+    }
+
+    const legacyData = legacyStorageKey ? localStorage.getItem(legacyStorageKey) : null;
+    if (legacyData === null) return [];
+
+    const shelves = JSON.parse(legacyData);
+    if (!Array.isArray(shelves)) return [];
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(shelves));
+    } catch {
+      // Keep legacy data available for this session if storage is full or unavailable.
+    }
+    return shelves;
   } catch {
     return [];
   }
@@ -54,32 +75,47 @@ function bookCountLabel(count) {
 }
 
 function App() {
-  const [books, setBooks] = useState(readBooks);
-  const [folders, setFolders] = useState(readFolders);
+  const [user, setUser] = useState(getCurrentUser);
+
+  function logout() {
+    clearAuthSession();
+    setUser(null);
+  }
+
+  if (!user) return <AuthPage onAuthenticated={setUser} />;
+  return <Library key={user.id} user={user} onLogout={logout} />;
+}
+
+function Library({ user, onLogout }) {
+  const bookStorageKey = user.isDemo ? STORAGE_KEY : `book-diary-${user.id}-books-v1`;
+  const shelfStorageKey = user.isDemo ? SHELVES_STORAGE_KEY : `book-diary-${user.id}-shelves-v1`;
+  const legacyShelfStorageKey = user.isDemo ? LEGACY_SHELVES_STORAGE_KEY : null;
+  const [books, setBooks] = useState(() => readBooks(bookStorageKey));
+  const [shelves, setShelves] = useState(() => readShelves(shelfStorageKey, legacyShelfStorageKey));
   const [filter, setFilter] = useState('all');
-  const [activeFolderId, setActiveFolderId] = useState('all');
+  const [activeShelfId, setActiveShelfId] = useState('all');
   const [sortBy, setSortBy] = useState('addedAt');
   const [sortDirection, setSortDirection] = useState('desc');
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(emptyForm);
   const [formOpen, setFormOpen] = useState(false);
   const [error, setError] = useState('');
-  const [folderFormOpen, setFolderFormOpen] = useState(false);
-  const [editingFolderId, setEditingFolderId] = useState(null);
-  const [folderName, setFolderName] = useState('');
-  const [folderBookIds, setFolderBookIds] = useState([]);
-  const [folderError, setFolderError] = useState('');
+  const [shelfFormOpen, setShelfFormOpen] = useState(false);
+  const [editingShelfId, setEditingShelfId] = useState(null);
+  const [shelfName, setShelfName] = useState('');
+  const [shelfBookIds, setShelfBookIds] = useState([]);
+  const [shelfError, setShelfError] = useState('');
   const coverInputRef = useRef(null);
   const coverTargetId = useRef(null);
   const coverHoldTimer = useRef(null);
   const coverHoldTriggered = useRef(false);
 
-  useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(books)), [books]);
-  useEffect(() => localStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(folders)), [folders]);
+  useEffect(() => localStorage.setItem(bookStorageKey, JSON.stringify(books)), [bookStorageKey, books]);
+  useEffect(() => localStorage.setItem(shelfStorageKey, JSON.stringify(shelves)), [shelfStorageKey, shelves]);
 
   const visibleBooks = useMemo(() => books
     .filter((book) => (filter === 'all' || book.status === filter)
-      && (activeFolderId === 'all' || book.folderId === activeFolderId))
+      && (activeShelfId === 'all' || book.shelfId === activeShelfId))
     .sort((left, right) => {
       let comparison = 0;
       if (sortBy === 'title' || sortBy === 'author') {
@@ -99,24 +135,24 @@ function App() {
       }
       if (comparison === 0) return (left.title || '').localeCompare(right.title || '', 'ru', { sensitivity: 'base' });
       return sortDirection === 'asc' ? comparison : -comparison;
-    }), [books, filter, activeFolderId, sortBy, sortDirection]);
+    }), [books, filter, activeShelfId, sortBy, sortDirection]);
 
-  const folderCounts = useMemo(() => folders.map((folder) => ({
-    ...folder,
-    count: books.filter((book) => book.folderId === folder.id).length,
-  })), [folders, books]);
-  const activeFolder = folderCounts.find((folder) => folder.id === activeFolderId);
+  const shelfCounts = useMemo(() => shelves.map((shelf) => ({
+    ...shelf,
+    count: books.filter((book) => book.shelfId === shelf.id).length,
+  })), [shelves, books]);
+  const activeShelf = shelfCounts.find((shelf) => shelf.id === activeShelfId);
 
   function openNew() {
     setEditingId(null);
-    setForm({ ...emptyForm, folderId: activeFolderId === 'all' ? '' : activeFolderId });
+    setForm({ ...emptyForm, shelfId: activeShelfId === 'all' ? '' : activeShelfId });
     setError('');
     setFormOpen(true);
   }
 
   function openEdit(book) {
     setEditingId(book.id);
-    setForm({ ...emptyForm, ...book, folderId: book.folderId || '', rating: book.status === 'planned' ? '' : (book.rating || '') });
+    setForm({ ...emptyForm, ...book, shelfId: book.shelfId || '', rating: book.status === 'planned' ? '' : (book.rating || '') });
     setError('');
     setFormOpen(true);
   }
@@ -152,7 +188,7 @@ function App() {
       impression: form.impression.trim(),
       startedAt: ['reading', 'read'].includes(form.status) ? form.startedAt : '',
       finishedAt: form.status === 'read' ? (form.finishedAt || today()) : '',
-      folderId: folders.some((folder) => folder.id === form.folderId) ? form.folderId : '',
+      shelfId: shelves.some((shelf) => shelf.id === form.shelfId) ? form.shelfId : '',
       addedAt: existingBook?.addedAt || (editingId ? '' : new Date().toISOString()),
       coverImage: existingBook?.coverImage || '',
     };
@@ -160,53 +196,53 @@ function App() {
     setFormOpen(false);
   }
 
-  function openFolderForm(folder = null) {
-    setEditingFolderId(folder?.id || null);
-    setFolderName(folder?.name || '');
-    setFolderBookIds(folder ? books.filter((book) => book.folderId === folder.id).map((book) => book.id) : []);
-    setFolderError('');
-    setFolderFormOpen(true);
+  function openShelfForm(shelf = null) {
+    setEditingShelfId(shelf?.id || null);
+    setShelfName(shelf?.name || '');
+    setShelfBookIds(shelf ? books.filter((book) => book.shelfId === shelf.id).map((book) => book.id) : []);
+    setShelfError('');
+    setShelfFormOpen(true);
   }
 
-  function saveFolder(event) {
+  function saveShelf(event) {
     event.preventDefault();
-    const name = folderName.trim();
+    const name = shelfName.trim();
     if (!name) {
-      setFolderError('Введите название папки.');
+      setShelfError('Введите название полки.');
       return;
     }
-    if (folders.some((folder) => folder.id !== editingFolderId && folder.name.toLocaleLowerCase('ru') === name.toLocaleLowerCase('ru'))) {
-      setFolderError('Папка с таким названием уже есть.');
+    if (shelves.some((shelf) => shelf.id !== editingShelfId && shelf.name.toLocaleLowerCase('ru') === name.toLocaleLowerCase('ru'))) {
+      setShelfError('Полка с таким названием уже есть.');
       return;
     }
-    const folderId = editingFolderId || crypto.randomUUID();
-    const folder = { id: folderId, name };
-    setFolders((current) => editingFolderId
-      ? current.map((item) => item.id === folderId ? folder : item)
-      : [...current, folder]);
+    const shelfId = editingShelfId || crypto.randomUUID();
+    const shelf = { id: shelfId, name };
+    setShelves((current) => editingShelfId
+      ? current.map((item) => item.id === shelfId ? shelf : item)
+      : [...current, shelf]);
     setBooks((current) => current.map((book) => {
-      if (folderBookIds.includes(book.id)) return { ...book, folderId };
-      if (editingFolderId && book.folderId === folderId) return { ...book, folderId: '' };
+      if (shelfBookIds.includes(book.id)) return { ...book, shelfId };
+      if (editingShelfId && book.shelfId === shelfId) return { ...book, shelfId: '' };
       return book;
     }));
-    if (!editingFolderId) setActiveFolderId(folderId);
-    setFolderName('');
-    setFolderBookIds([]);
-    setFolderError('');
-    setFolderFormOpen(false);
+    if (!editingShelfId) setActiveShelfId(shelfId);
+    setShelfName('');
+    setShelfBookIds([]);
+    setShelfError('');
+    setShelfFormOpen(false);
   }
 
-  function removeFolder(folder) {
-    if (!window.confirm(`Удалить папку «${folder.name}»? Книги останутся в трекере без папки.`)) return;
-    setFolders((current) => current.filter((item) => item.id !== folder.id));
-    setBooks((current) => current.map((book) => book.folderId === folder.id ? { ...book, folderId: '' } : book));
-    if (activeFolderId === folder.id) setActiveFolderId('all');
+  function removeShelf(shelf) {
+    if (!window.confirm(`Удалить полку «${shelf.name}»? Книги останутся в трекере без полки.`)) return;
+    setShelves((current) => current.filter((item) => item.id !== shelf.id));
+    setBooks((current) => current.map((book) => book.shelfId === shelf.id ? { ...book, shelfId: '' } : book));
+    if (activeShelfId === shelf.id) setActiveShelfId('all');
   }
 
   function exportData() {
     const csvCell = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`;
     const rows = [
-      ['ID', 'Название', 'Автор', 'Статус', 'Оценка', 'Впечатление', 'Папка', 'Начало чтения', 'Дата прочтения', 'Дата добавления'],
+      ['ID', 'Название', 'Автор', 'Статус', 'Оценка', 'Впечатление', 'Полка', 'Начало чтения', 'Дата прочтения', 'Дата добавления'],
       ...books.map((book) => [
         book.id,
         book.title,
@@ -214,7 +250,7 @@ function App() {
         STATUSES.find((status) => status.value === book.status)?.label || book.status,
         book.rating,
         book.impression,
-        folders.find((folder) => folder.id === book.folderId)?.name || '',
+        shelves.find((shelf) => shelf.id === book.shelfId)?.name || '',
         book.startedAt,
         book.finishedAt,
         book.addedAt,
@@ -304,7 +340,10 @@ function App() {
         <a className="brand" href="#top" aria-label="Книжный трекер Shelves — главная">
           <span>Shelves</span>
         </a>
-        <span className="private-note"><span className="lock" aria-hidden="true">●</span> Личное пространство</span>
+        <div className="topbar-account">
+          <span className="private-note"><span className="lock" aria-hidden="true">●</span> {user.email}</span>
+          <button type="button" className="logout-link" onClick={onLogout}>Выйти</button>
+        </div>
       </header>
 
       <section className="library" aria-label="Список книг">
@@ -341,30 +380,30 @@ function App() {
           </div>
         </div>
 
-        <section className="folder-section" aria-label="Папки книг">
-          <div className="folder-heading">
-            <h3>Папки</h3>
-            <button type="button" className="folder-add" onClick={() => openFolderForm()}>＋ Новая папка</button>
+        <section className="shelf-section" aria-label="Полки книг">
+          <div className="shelf-heading">
+            <h3>Полки</h3>
+            <button type="button" className="shelf-add" onClick={() => openShelfForm()}>＋ Новая полка</button>
           </div>
-          <div className="folder-grid">
-            <div className={`folder-card${activeFolderId === 'all' ? ' is-active' : ''}`}>
-              <button type="button" className="folder-select" onClick={() => setActiveFolderId('all')}>
-                <span className="folder-name">Все книги</span>
-                <span className="folder-count">{bookCountLabel(books.length)}</span>
+          <div className="shelf-grid">
+            <div className={`shelf-card${activeShelfId === 'all' ? ' is-active' : ''}`}>
+              <button type="button" className="shelf-select" onClick={() => setActiveShelfId('all')}>
+                <span className="shelf-name">Все книги</span>
+                <span className="shelf-count">{bookCountLabel(books.length)}</span>
               </button>
             </div>
-            {folderCounts.map((folder) => <div key={folder.id} className={`folder-card${activeFolderId === folder.id ? ' is-active' : ''}`}>
-              <button type="button" className="folder-select" onClick={() => setActiveFolderId(folder.id)}>
-                <span className="folder-name">{folder.name}</span>
-                <span className="folder-count">{bookCountLabel(folder.count)}</span>
+            {shelfCounts.map((shelf) => <div key={shelf.id} className={`shelf-card${activeShelfId === shelf.id ? ' is-active' : ''}`}>
+              <button type="button" className="shelf-select" onClick={() => setActiveShelfId(shelf.id)}>
+                <span className="shelf-name">{shelf.name}</span>
+                <span className="shelf-count">{bookCountLabel(shelf.count)}</span>
               </button>
             </div>)}
           </div>
-          <div className="active-folder-row">
-            <h3>{activeFolder?.name || 'Все книги'}</h3>
-            {activeFolder && <div className="active-folder-actions">
-              <button type="button" onClick={() => openFolderForm(activeFolder)}>Изменить</button>
-              <button type="button" className="folder-delete" onClick={() => removeFolder(activeFolder)}>Удалить папку</button>
+          <div className="active-shelf-row">
+            <h3>{activeShelf?.name || 'Все книги'}</h3>
+            {activeShelf && <div className="active-shelf-actions">
+              <button type="button" onClick={() => openShelfForm(activeShelf)}>Изменить</button>
+              <button type="button" className="shelf-delete" onClick={() => removeShelf(activeShelf)}>Удалить полку</button>
             </div>}
           </div>
         </section>
@@ -416,7 +455,7 @@ function App() {
         </div> : <div className="empty-state">
           <div className="empty-icon" aria-hidden="true">✳</div>
           <h3>{books.length ? 'В этом разделе пока пусто' : 'Ваша первая книга начинается здесь'}</h3>
-          <p>{books.length ? (activeFolderId === 'all' ? 'Выберите другой статус или добавьте книгу.' : 'Добавьте книгу в эту папку или выберите другую.') : 'Добавьте книгу, чтобы сохранить её в трекере.'}</p>
+          <p>{books.length ? (activeShelfId === 'all' ? 'Выберите другой статус или добавьте книгу.' : 'Добавьте книгу на эту полку или выберите другую.') : 'Добавьте книгу, чтобы сохранить её в трекере.'}</p>
           {!books.length && <button className="button button-secondary" onClick={openNew}><span className="plus">＋</span> Добавить первую книгу</button>}
         </div>}
       </section>
@@ -435,7 +474,7 @@ function App() {
               <label className="field">Статус<select value={form.status} onChange={(event) => updateField('status', event.target.value)}>{STATUSES.map((status) => <option value={status.value} key={status.value}>{status.label}</option>)}</select></label>
               {form.status !== 'planned' && <label className="field">Оценка<select value={form.rating} onChange={(event) => updateField('rating', event.target.value)}><option value="">Без оценки</option>{[5, 4, 3, 2, 1].map((value) => <option value={value} key={value}>{value} из 5</option>)}</select></label>}
             </div>
-            <label className="field">Папка<select value={form.folderId} onChange={(event) => updateField('folderId', event.target.value)}><option value="">Без папки</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select></label>
+            <label className="field">Полка<select value={form.shelfId} onChange={(event) => updateField('shelfId', event.target.value)}><option value="">Без полки</option>{shelves.map((shelf) => <option key={shelf.id} value={shelf.id}>{shelf.name}</option>)}</select></label>
             {['reading', 'read'].includes(form.status) && <label className="field">Начало чтения<input type="date" value={form.startedAt} onChange={(event) => updateField('startedAt', event.target.value)} /></label>}
             {form.status === 'read' && <label className="field">Дата завершения<input type="date" value={form.finishedAt || today()} onChange={(event) => updateField('finishedAt', event.target.value)} /></label>}
             <label className="field">Впечатление<textarea value={form.impression} onChange={(event) => updateField('impression', event.target.value)} placeholder="Что хочется запомнить об этой книге?" rows="4" /></label>
@@ -445,21 +484,21 @@ function App() {
         </section>
       </div>}
 
-      {folderFormOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setFolderFormOpen(false); }}>
-        <section className="dialog folder-dialog" role="dialog" aria-modal="true" aria-labelledby="folder-dialog-title">
-          <div className="dialog-heading"><div><span className="section-kicker">КАТАЛОГ</span><h2 id="folder-dialog-title">{editingFolderId ? 'Переименовать папку' : 'Новая папка'}</h2></div><button className="close-button" onClick={() => setFolderFormOpen(false)} aria-label="Закрыть">×</button></div>
-          <form onSubmit={saveFolder}>
-            <label className="field">Название папки<input autoFocus value={folderName} onChange={(event) => setFolderName(event.target.value)} placeholder="Например, Фантастика" /></label>
-            <fieldset className="folder-book-picker">
-              <legend>Книги в папке</legend>
-              <p>{editingFolderId ? 'Выберите книги, которые должны остаться в этой папке.' : 'Можно сразу добавить книги в новую папку.'}</p>
-              {books.length ? <div className="folder-book-list">{books.map((book) => <label className="folder-book-option" key={book.id}>
-                <input type="checkbox" checked={folderBookIds.includes(book.id)} onChange={(event) => setFolderBookIds((current) => event.target.checked ? [...current, book.id] : current.filter((id) => id !== book.id))} />
-                <span>{book.title} <span className="folder-book-author">— {book.author}</span></span>
-              </label>)}</div> : <p className="folder-book-empty">Сначала добавьте книги в каталог.</p>}
+      {shelfFormOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShelfFormOpen(false); }}>
+        <section className="dialog shelf-dialog" role="dialog" aria-modal="true" aria-labelledby="shelf-dialog-title">
+          <div className="dialog-heading"><div><span className="section-kicker">КАТАЛОГ</span><h2 id="shelf-dialog-title">{editingShelfId ? 'Переименовать полку' : 'Новая полка'}</h2></div><button className="close-button" onClick={() => setShelfFormOpen(false)} aria-label="Закрыть">×</button></div>
+          <form onSubmit={saveShelf}>
+            <label className="field">Название полки<input autoFocus value={shelfName} onChange={(event) => setShelfName(event.target.value)} placeholder="Например, Фантастика" /></label>
+            <fieldset className="shelf-book-picker">
+              <legend>Книги на полке</legend>
+              <p>{editingShelfId ? 'Выберите книги, которые должны остаться на этой полке.' : 'Можно сразу добавить книги на новую полку.'}</p>
+              {books.length ? <div className="shelf-book-list">{books.map((book) => <label className="shelf-book-option" key={book.id}>
+                <input type="checkbox" checked={shelfBookIds.includes(book.id)} onChange={(event) => setShelfBookIds((current) => event.target.checked ? [...current, book.id] : current.filter((id) => id !== book.id))} />
+                <span>{book.title} <span className="shelf-book-author">— {book.author}</span></span>
+              </label>)}</div> : <p className="shelf-book-empty">Сначала добавьте книги в каталог.</p>}
             </fieldset>
-            {folderError && <p className="form-error" role="alert">{folderError}</p>}
-            <div className="form-actions"><button type="button" className="button button-plain" onClick={() => setFolderFormOpen(false)}>Отмена</button><button type="submit" className="button button-primary">{editingFolderId ? 'Сохранить' : 'Создать папку'}</button></div>
+            {shelfError && <p className="form-error" role="alert">{shelfError}</p>}
+            <div className="form-actions"><button type="button" className="button button-plain" onClick={() => setShelfFormOpen(false)}>Отмена</button><button type="submit" className="button button-primary">{editingShelfId ? 'Сохранить' : 'Создать полку'}</button></div>
           </form>
         </section>
       </div>}
